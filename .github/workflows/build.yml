@@ -1,0 +1,448 @@
+name: Build Trade Bridge APK
+
+on:
+  push:
+    branches: [ "main", "master" ]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Set up Java 17
+        uses: actions/setup-java@v4
+        with:
+          java-version: '17'
+          distribution: 'temurin'
+
+      - name: Setup Gradle
+        uses: gradle/actions/setup-gradle@v3
+        with:
+          gradle-version: '8.7'
+
+      - name: Generate Android Project Code
+        run: |
+          mkdir -p gradle
+          mkdir -p app/src/main/java/com/tradesignal/bridge/data
+          mkdir -p app/src/main/java/com/tradesignal/bridge/service
+          mkdir -p app/src/main/java/com/tradesignal/bridge/ui
+          mkdir -p app/src/main/res/values
+
+          # 1. settings.gradle.kts
+          cat << 'EOF' > settings.gradle.kts
+          pluginManagement {
+              repositories {
+                  google()
+                  mavenCentral()
+                  gradlePluginPortal()
+              }
+          }
+          dependencyResolutionManagement {
+              repositoriesMode.set(RepositoriesMode.FAIL_ON_PROJECT_REPOS)
+              repositories {
+                  google()
+                  mavenCentral()
+              }
+          }
+          rootProject.name = "TradeBridge"
+          include(":app")
+          EOF
+
+          # 2. Root build.gradle.kts
+          cat << 'EOF' > build.gradle.kts
+          plugins {
+              id("com.android.application") version "8.5.2" apply false
+              id("org.jetbrains.kotlin.android") version "1.9.24" apply false
+              id("org.jetbrains.kotlin.plugin.serialization") version "1.9.24" apply false
+              id("com.google.devtools.ksp") version "1.9.24-1.0.20" apply false
+          }
+          EOF
+
+          # 3. app/build.gradle.kts
+          cat << 'EOF' > app/build.gradle.kts
+          plugins {
+              id("com.android.application")
+              id("org.jetbrains.kotlin.android")
+              id("org.jetbrains.kotlin.plugin.serialization")
+              id("com.google.devtools.ksp")
+          }
+          android {
+              namespace = "com.tradesignal.bridge"
+              compileSdk = 34
+              defaultConfig {
+                  applicationId = "com.tradesignal.bridge"
+                  minSdk = 29
+                  targetSdk = 34
+                  versionCode = 1
+                  versionName = "1.0"
+              }
+              compileOptions {
+                  sourceCompatibility = JavaVersion.VERSION_17
+                  targetCompatibility = JavaVersion.VERSION_17
+              }
+              kotlinOptions {
+                  jvmTarget = "17"
+              }
+              buildFeatures {
+                  compose = true
+              }
+              composeOptions {
+                  kotlinCompilerExtensionVersion = "1.5.14"
+              }
+          }
+          dependencies {
+              implementation("androidx.core:core-ktx:1.13.1")
+              implementation("androidx.lifecycle:lifecycle-runtime-ktx:2.8.4")
+              implementation("androidx.activity:activity-compose:1.9.1")
+              implementation(platform("androidx.compose:compose-bom:2024.06.00"))
+              implementation("androidx.compose.ui:ui")
+              implementation("androidx.compose.ui:ui-graphics")
+              implementation("androidx.compose.material3:material3")
+              
+              val ktor = "2.3.12"
+              implementation("io.ktor:ktor-server-core:$ktor")
+              implementation("io.ktor:ktor-server-cio:$ktor")
+              implementation("io.ktor:ktor-server-content-negotiation:$ktor")
+              implementation("io.ktor:ktor-serialization-kotlinx-json:$ktor")
+              
+              val room = "2.6.1"
+              implementation("androidx.room:room-runtime:$room")
+              implementation("androidx.room:room-ktx:$room")
+              ksp("androidx.room:room-compiler:$room")
+              
+              implementation("org.jetbrains.kotlinx:kotlinx-serialization-json:1.6.3")
+          }
+          EOF
+
+          # 4. AndroidManifest.xml
+          cat << 'EOF' > app/src/main/AndroidManifest.xml
+          <?xml version="1.0" encoding="utf-8"?>
+          <manifest xmlns:android="http://schemas.android.com/apk/res/android">
+              <uses-permission android:name="android.permission.INTERNET" />
+              <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
+              <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+              <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+              <uses-permission android:name="android.permission.FOREGROUND_SERVICE_DATA_SYNC" />
+
+              <queries>
+                  <package android:name="com.metaquotes.metatrader5" />
+              </queries>
+
+              <application
+                  android:name=".TradingApp"
+                  android:allowBackup="true"
+                  android:icon="@android:drawable/ic_menu_compass"
+                  android:label="Trade Signal Bridge"
+                  android:theme="@android:style/Theme.Material.NoActionBar">
+                  <service
+                      android:name=".service.SignalListenerService"
+                      android:foregroundServiceType="dataSync"
+                      android:exported="false" />
+                  <activity
+                      android:name=".MainActivity"
+                      android:exported="true">
+                      <intent-filter>
+                          <action android:name="android.intent.action.MAIN" />
+                          <category android:name="android.intent.category.LAUNCHER" />
+                      </intent-filter>
+                  </activity>
+              </application>
+          </manifest>
+          EOF
+
+          # 5. TradingApp.kt
+          cat << 'EOF' > app/src/main/java/com/tradesignal/bridge/TradingApp.kt
+          package com.tradesignal.bridge
+          import android.app.Application
+          import android.app.NotificationChannel
+          import android.app.NotificationManager
+          import android.content.Context
+          import androidx.room.Room
+          import com.tradesignal.bridge.data.AppDatabase
+
+          class TradingApp : Application() {
+              companion object {
+                  lateinit var database: AppDatabase
+                  const val CHANNEL_ID = "trading_signals_channel"
+              }
+              override fun onCreate() {
+                  super.onCreate()
+                  database = Room.databaseBuilder(
+                      applicationContext,
+                      AppDatabase::class.java,
+                      "trade_signals.db"
+                  ).fallbackToDestructiveMigration().build()
+
+                  val channel = NotificationChannel(
+                      CHANNEL_ID,
+                      "Trading Signals",
+                      NotificationManager.IMPORTANCE_HIGH
+                  ).apply { enableVibration(true) }
+                  (getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager).createNotificationChannel(channel)
+              }
+          }
+          EOF
+
+          # 6. SignalEntity.kt
+          cat << 'EOF' > app/src/main/java/com/tradesignal/bridge/data/SignalEntity.kt
+          package com.tradesignal.bridge.data
+          import androidx.room.*
+          import kotlinx.coroutines.flow.Flow
+          import kotlinx.serialization.Serializable
+
+          @Serializable
+          @Entity(tableName = "signals")
+          data class TradeSignal(
+              @PrimaryKey(autoGenerate = true) val id: Int = 0,
+              val symbol: String,
+              val action: String,
+              val entry: Double,
+              val sl: Double,
+              val tp: Double,
+              val timeframe: String = "15m",
+              val notes: String = "",
+              val timestamp: Long = System.currentTimeMillis()
+          )
+
+          @Dao
+          interface SignalDao {
+              @Query("SELECT * FROM signals ORDER BY timestamp DESC")
+              fun getAllSignals(): Flow<List<TradeSignal>>
+              @Insert(onConflict = OnConflictStrategy.REPLACE)
+              suspend fun insertSignal(signal: TradeSignal)
+          }
+
+          @Database(entities = [TradeSignal::class], version = 1, exportSchema = false)
+          abstract class AppDatabase : RoomDatabase() {
+              abstract fun signalDao(): SignalDao
+          }
+          EOF
+
+          # 7. SignalListenerService.kt
+          cat << 'EOF' > app/src/main/java/com/tradesignal/bridge/service/SignalListenerService.kt
+          package com.tradesignal.bridge.service
+          import android.app.*
+          import android.content.Context
+          import android.content.Intent
+          import android.os.IBinder
+          import androidx.core.app.NotificationCompat
+          import com.tradesignal.bridge.MainActivity
+          import com.tradesignal.bridge.TradingApp
+          import com.tradesignal.bridge.data.TradeSignal
+          import io.ktor.serialization.kotlinx.json.*
+          import io.ktor.server.application.*
+          import io.ktor.server.cio.*
+          import io.ktor.server.engine.*
+          import io.ktor.server.plugins.contentnegotiation.*
+          import io.ktor.server.request.*
+          import io.ktor.server.response.*
+          import io.ktor.server.routing.*
+          import kotlinx.coroutines.*
+          import kotlinx.serialization.json.Json
+
+          class SignalListenerService : Service() {
+              private val serviceScope = CoroutineScope(Dispatchers.IO + SupervisorJob())
+              private var server: EmbeddedServer<*, *>? = null
+
+              override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
+                  val notification = NotificationCompat.Builder(this, TradingApp.CHANNEL_ID)
+                      .setContentTitle("Trade Bridge Engine")
+                      .setContentText("Listening on port 8080...")
+                      .setSmallIcon(android.R.drawable.ic_menu_info_details)
+                      .build()
+                  startForeground(1001, notification)
+
+                  if (server == null) {
+                      serviceScope.launch {
+                          server = embeddedServer(CIO, port = 8080, host = "0.0.0.0") {
+                              install(ContentNegotiation) { json(Json { ignoreUnknownKeys = true }) }
+                              routing {
+                                  post("/signal") {
+                                      val signal = call.receive<TradeSignal>()
+                                      TradingApp.database.signalDao().insertSignal(signal)
+                                      notifyUser(signal)
+                                      call.respondText("Received")
+                                  }
+                              }
+                          }.start(wait = false)
+                      }
+                  }
+                  return START_STICKY
+              }
+
+              private fun notifyUser(signal: TradeSignal) {
+                  val intent = Intent(this, MainActivity::class.java)
+                  val pi = PendingIntent.getActivity(this, 0, intent, PendingIntent.FLAG_IMMUTABLE)
+                  val notif = NotificationCompat.Builder(this, TradingApp.CHANNEL_ID)
+                      .setContentTitle("${signal.action} ${signal.symbol}")
+                      .setContentText("Entry: ${signal.entry} | TP: ${signal.tp} | SL: ${signal.sl}")
+                      .setSmallIcon(android.R.drawable.ic_dialog_alert)
+                      .setPriority(NotificationCompat.PRIORITY_HIGH)
+                      .setContentIntent(pi)
+                      .setAutoCancel(true)
+                      .build()
+                  (getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager).notify(System.currentTimeMillis().toInt(), notif)
+              }
+
+              override fun onDestroy() {
+                  super.onDestroy()
+                  server?.stop(1000, 2000)
+                  serviceScope.cancel()
+              }
+              override fun onBind(intent: Intent?): IBinder? = null
+          }
+          EOF
+
+          # 8. SetupCanvas.kt
+          cat << 'EOF' > app/src/main/java/com/tradesignal/bridge/ui/SetupCanvas.kt
+          package com.tradesignal.bridge.ui
+          import androidx.compose.foundation.Canvas
+          import androidx.compose.foundation.layout.*
+          import androidx.compose.material3.Text
+          import androidx.compose.runtime.Composable
+          import androidx.compose.ui.Modifier
+          import androidx.compose.ui.geometry.Offset
+          import androidx.compose.ui.graphics.Color
+          import androidx.compose.ui.graphics.PathEffect
+          import androidx.compose.ui.text.TextStyle
+          import androidx.compose.ui.text.drawText
+          import androidx.compose.ui.text.rememberTextMeasurer
+          import androidx.compose.ui.unit.dp
+          import androidx.compose.ui.unit.sp
+          import com.tradesignal.bridge.data.TradeSignal
+          import java.util.Locale
+          import kotlin.math.abs
+
+          @Composable
+          fun SetupCanvas(signal: TradeSignal, modifier: Modifier = Modifier) {
+              val measurer = rememberTextMeasurer()
+              val risk = abs(signal.entry - signal.sl)
+              val reward = abs(signal.tp - signal.entry)
+              val rr = if (risk > 0.0) reward / risk else 0.0
+
+              Column(modifier = modifier) {
+                  Text("R:R = 1 : " + String.format(Locale.US, "%.2f", rr), color = Color(0xFFFFD700), fontSize = 12.sp)
+                  Canvas(modifier = Modifier.fillMaxWidth().height(110.dp)) {
+                      val w = size.width
+                      val h = size.height
+                      val minP = minOf(signal.sl, signal.entry, signal.tp)
+                      val maxP = maxOf(signal.sl, signal.entry, signal.tp)
+                      val range = if (maxP - minP == 0.0) 1.0 else maxP - minP
+
+                      fun getY(p: Double) = (h - ((p - minP) / range * (h - 40f) + 20f)).toFloat()
+
+                      val tpY = getY(signal.tp)
+                      val entryY = getY(signal.entry)
+                      val slY = getY(signal.sl)
+
+                      drawLine(Color(0xFF00E676), Offset(0f, tpY), Offset(w, tpY), 3f)
+                      drawText(measurer, "TP: ${signal.tp}", Offset(10f, tpY - 24f), TextStyle(color = Color(0xFF00E676), fontSize = 11.sp))
+
+                      drawLine(Color(0xFF2979FF), Offset(0f, entryY), Offset(w, entryY), 3f, pathEffect = PathEffect.dashPathEffect(floatArrayOf(15f, 10f), 0f))
+                      drawText(measurer, "ENTRY: ${signal.entry}", Offset(10f, entryY - 24f), TextStyle(color = Color(0xFF2979FF), fontSize = 11.sp))
+
+                      drawLine(Color(0xFFFF1744), Offset(0f, slY), Offset(w, slY), 3f)
+                      drawText(measurer, "SL: ${signal.sl}", Offset(10f, slY - 24f), TextStyle(color = Color(0xFFFF1744), fontSize = 11.sp))
+                  }
+              }
+          }
+          EOF
+
+          # 9. MainActivity.kt
+          cat << 'EOF' > app/src/main/java/com/tradesignal/bridge/MainActivity.kt
+          package com.tradesignal.bridge
+          import android.Manifest
+          import android.content.*
+          import android.content.pm.PackageManager
+          import android.net.Uri
+          import android.os.Build
+          import android.os.Bundle
+          import android.widget.Toast
+          import androidx.activity.ComponentActivity
+          import androidx.activity.compose.setContent
+          import androidx.activity.result.contract.ActivityResultContracts
+          import androidx.compose.foundation.layout.*
+          import androidx.compose.foundation.lazy.LazyColumn
+          import androidx.compose.foundation.lazy.items
+          import androidx.compose.foundation.shape.RoundedCornerShape
+          import androidx.compose.material3.*
+          import androidx.compose.runtime.*
+          import androidx.compose.ui.Alignment
+          import androidx.compose.ui.Modifier
+          import androidx.compose.ui.graphics.Color
+          import androidx.compose.ui.platform.LocalContext
+          import androidx.compose.ui.text.font.FontWeight
+          import androidx.compose.ui.unit.dp
+          import androidx.compose.ui.unit.sp
+          import androidx.core.content.ContextCompat
+          import com.tradesignal.bridge.service.SignalListenerService
+          import com.tradesignal.bridge.ui.SetupCanvas
+
+          class MainActivity : ComponentActivity() {
+              private val launcher = registerForActivityResult(ActivityResultContracts.RequestPermission()) {}
+              override fun onCreate(savedInstanceState: Bundle?) {
+                  super.onCreate(savedInstanceState)
+                  if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU &&
+                      ContextCompat.checkSelfPermission(this, Manifest.permission.POST_NOTIFICATIONS) != PackageManager.PERMISSION_GRANTED) {
+                      launcher.launch(Manifest.permission.POST_NOTIFICATIONS)
+                  }
+                  ContextCompat.startForegroundService(this, Intent(this, SignalListenerService::class.java))
+                  setContent {
+                      val context = LocalContext.current
+                      val signals by TradingApp.database.signalDao().getAllSignals().collectAsState(initial = emptyList())
+                      Surface(color = Color(0xFF0D1117), modifier = Modifier.fillMaxSize()) {
+                          Column(modifier = Modifier.padding(16.dp)) {
+                              Text("SIGNAL BRIDGE [LIVE]", color = Color.White, fontWeight = FontWeight.Bold, fontSize = 18.sp)
+                              Spacer(modifier = Modifier.height(16.dp))
+                              if (signals.isEmpty()) {
+                                  Box(modifier = Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
+                                      Text("Listening on port 8080...", color = Color.Gray)
+                                  }
+                              } else {
+                                  LazyColumn(verticalArrangement = Arrangement.spacedBy(12.dp)) {
+                                      items(signals) { sig ->
+                                          val snippet = "${sig.action} ${sig.symbol} sl=${sig.sl} tp=${sig.tp}"
+                                          Card(colors = CardDefaults.cardColors(containerColor = Color(0xFF161B22))) {
+                                              Column(modifier = Modifier.padding(12.dp)) {
+                                                  Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
+                                                      Text("${sig.action} ${sig.symbol}", color = if (sig.action.uppercase() == "BUY") Color(0xFF00E676) else Color(0xFFFF1744), fontWeight = FontWeight.Bold)
+                                                      Text(sig.timeframe, color = Color.Gray, fontSize = 12.sp)
+                                                  }
+                                                  Spacer(modifier = Modifier.height(8.dp))
+                                                  SetupCanvas(sig)
+                                                  Spacer(modifier = Modifier.height(8.dp))
+                                                  Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                                                      OutlinedButton(onClick = {
+                                                          (context.getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager).setPrimaryClip(ClipData.newPlainText("Trade", snippet))
+                                                          Toast.makeText(context, "Copied!", Toast.LENGTH_SHORT).show()
+                                                      }, modifier = Modifier.weight(1f)) { Text("Copy MT5") }
+                                                      Button(onClick = {
+                                                          (context.getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager).setPrimaryClip(ClipData.newPlainText("Trade", snippet))
+                                                          val intent = context.packageManager.getLaunchIntentForPackage("com.metaquotes.metatrader5")
+                                                          if (intent != null) context.startActivity(intent)
+                                                          else context.startActivity(Intent(Intent.ACTION_VIEW, Uri.parse("https://play.google.com/store/apps/details?id=com.metaquotes.metatrader5")))
+                                                      }, modifier = Modifier.weight(1f), colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF2979FF))) {
+                                                          Text("Open MT5", color = Color.White)
+                                                      }
+                                                  }
+                                              }
+                                          }
+                                      }
+                                  }
+                              }
+                          }
+                      }
+                  }
+              }
+          }
+          EOF
+
+      - name: Build APK with Gradle
+        run: gradle assembleDebug --stacktrace
+
+      - name: Upload APK File
+        uses: actions/upload-artifact@v4
+        with:
+          name: TradeSignalBridge-APK
+          path: app/build/outputs/apk/debug/app-debug.apk
