@@ -55,7 +55,6 @@ jobs:
               id("com.android.application") version "8.5.2" apply false
               id("org.jetbrains.kotlin.android") version "1.9.24" apply false
               id("org.jetbrains.kotlin.plugin.serialization") version "1.9.24" apply false
-              id("com.google.devtools.ksp") version "1.9.24-1.0.20" apply false
           }
           EOF
 
@@ -65,7 +64,6 @@ jobs:
               id("com.android.application")
               id("org.jetbrains.kotlin.android")
               id("org.jetbrains.kotlin.plugin.serialization")
-              id("com.google.devtools.ksp")
           }
           android {
               namespace = "com.tradesignal.bridge"
@@ -90,6 +88,13 @@ jobs:
               composeOptions {
                   kotlinCompilerExtensionVersion = "1.5.14"
               }
+              packaging {
+                  resources {
+                      excludes += "/META-INF/{AL2.0,LGPL2.1}"
+                      excludes += "/META-INF/INDEX.LIST"
+                      excludes += "/META-INF/io.netty.versions.properties"
+                  }
+              }
           }
           dependencies {
               implementation("androidx.core:core-ktx:1.13.1")
@@ -106,12 +111,8 @@ jobs:
               implementation("io.ktor:ktor-server-content-negotiation:$ktor")
               implementation("io.ktor:ktor-serialization-kotlinx-json:$ktor")
               
-              val room = "2.6.1"
-              implementation("androidx.room:room-runtime:$room")
-              implementation("androidx.room:room-ktx:$room")
-              ksp("androidx.room:room-compiler:$room")
-              
               implementation("org.jetbrains.kotlinx:kotlinx-serialization-json:1.6.3")
+              implementation("org.jetbrains.kotlinx:kotlinx-coroutines-android:1.8.1")
           }
           EOF
 
@@ -158,21 +159,16 @@ jobs:
           import android.app.NotificationChannel
           import android.app.NotificationManager
           import android.content.Context
-          import androidx.room.Room
-          import com.tradesignal.bridge.data.AppDatabase
+          import com.tradesignal.bridge.data.SignalStorage
 
           class TradingApp : Application() {
               companion object {
-                  lateinit var database: AppDatabase
+                  lateinit var storage: SignalStorage
                   const val CHANNEL_ID = "trading_signals_channel"
               }
               override fun onCreate() {
                   super.onCreate()
-                  database = Room.databaseBuilder(
-                      applicationContext,
-                      AppDatabase::class.java,
-                      "trade_signals.db"
-                  ).fallbackToDestructiveMigration().build()
+                  storage = SignalStorage(applicationContext)
 
                   val channel = NotificationChannel(
                       CHANNEL_ID,
@@ -184,17 +180,19 @@ jobs:
           }
           EOF
 
-          # 6. SignalEntity.kt
+          # 6. SignalStorage.kt
           cat << 'EOF' > app/src/main/java/com/tradesignal/bridge/data/SignalEntity.kt
           package com.tradesignal.bridge.data
-          import androidx.room.*
-          import kotlinx.coroutines.flow.Flow
+          import android.content.Context
+          import kotlinx.coroutines.flow.MutableStateFlow
+          import kotlinx.coroutines.flow.StateFlow
           import kotlinx.serialization.Serializable
+          import kotlinx.serialization.encodeToString
+          import kotlinx.serialization.json.Json
 
           @Serializable
-          @Entity(tableName = "signals")
           data class TradeSignal(
-              @PrimaryKey(autoGenerate = true) val id: Int = 0,
+              val id: Long = System.currentTimeMillis(),
               val symbol: String,
               val action: String,
               val entry: Double,
@@ -205,17 +203,28 @@ jobs:
               val timestamp: Long = System.currentTimeMillis()
           )
 
-          @Dao
-          interface SignalDao {
-              @Query("SELECT * FROM signals ORDER BY timestamp DESC")
-              fun getAllSignals(): Flow<List<TradeSignal>>
-              @Insert(onConflict = OnConflictStrategy.REPLACE)
-              suspend fun insertSignal(signal: TradeSignal)
-          }
+          class SignalStorage(context: Context) {
+              private val prefs = context.getSharedPreferences("trade_signals_prefs", Context.MODE_PRIVATE)
+              private val json = Json { ignoreUnknownKeys = true }
+              private val _signals = MutableStateFlow<List<TradeSignal>>(loadSignals())
+              val signals: StateFlow<List<TradeSignal>> = _signals
 
-          @Database(entities = [TradeSignal::class], version = 1, exportSchema = false)
-          abstract class AppDatabase : RoomDatabase() {
-              abstract fun signalDao(): SignalDao
+              @Synchronized
+              fun addSignal(signal: TradeSignal) {
+                  val current = _signals.value.toMutableList()
+                  current.add(0, signal)
+                  _signals.value = current
+                  prefs.edit().putString("signals_json", json.encodeToString(current)).apply()
+              }
+
+              private fun loadSignals(): List<TradeSignal> {
+                  val raw = prefs.getString("signals_json", null) ?: return emptyList()
+                  return try {
+                      json.decodeFromString<List<TradeSignal>>(raw)
+                  } catch (e: Exception) {
+                      emptyList()
+                  }
+              }
           }
           EOF
 
@@ -260,7 +269,7 @@ jobs:
                               routing {
                                   post("/signal") {
                                       val signal = call.receive<TradeSignal>()
-                                      TradingApp.database.signalDao().insertSignal(signal)
+                                      TradingApp.storage.addSignal(signal)
                                       notifyUser(signal)
                                       call.respondText("Received")
                                   }
@@ -305,9 +314,6 @@ jobs:
           import androidx.compose.ui.geometry.Offset
           import androidx.compose.ui.graphics.Color
           import androidx.compose.ui.graphics.PathEffect
-          import androidx.compose.ui.text.TextStyle
-          import androidx.compose.ui.text.drawText
-          import androidx.compose.ui.text.rememberTextMeasurer
           import androidx.compose.ui.unit.dp
           import androidx.compose.ui.unit.sp
           import com.tradesignal.bridge.data.TradeSignal
@@ -316,34 +322,33 @@ jobs:
 
           @Composable
           fun SetupCanvas(signal: TradeSignal, modifier: Modifier = Modifier) {
-              val measurer = rememberTextMeasurer()
               val risk = abs(signal.entry - signal.sl)
               val reward = abs(signal.tp - signal.entry)
               val rr = if (risk > 0.0) reward / risk else 0.0
 
               Column(modifier = modifier) {
                   Text("R:R = 1 : " + String.format(Locale.US, "%.2f", rr), color = Color(0xFFFFD700), fontSize = 12.sp)
-                  Canvas(modifier = Modifier.fillMaxWidth().height(110.dp)) {
+                  Canvas(modifier = Modifier.fillMaxWidth().height(100.dp)) {
                       val w = size.width
                       val h = size.height
                       val minP = minOf(signal.sl, signal.entry, signal.tp)
                       val maxP = maxOf(signal.sl, signal.entry, signal.tp)
                       val range = if (maxP - minP == 0.0) 1.0 else maxP - minP
 
-                      fun getY(p: Double) = (h - ((p - minP) / range * (h - 40f) + 20f)).toFloat()
+                      fun getY(p: Double) = (h - ((p - minP) / range * (h - 30f) + 15f)).toFloat()
 
                       val tpY = getY(signal.tp)
                       val entryY = getY(signal.entry)
                       val slY = getY(signal.sl)
 
-                      drawLine(Color(0xFF00E676), Offset(0f, tpY), Offset(w, tpY), 3f)
-                      drawText(measurer, "TP: ${signal.tp}", Offset(10f, tpY - 24f), TextStyle(color = Color(0xFF00E676), fontSize = 11.sp))
-
-                      drawLine(Color(0xFF2979FF), Offset(0f, entryY), Offset(w, entryY), 3f, pathEffect = PathEffect.dashPathEffect(floatArrayOf(15f, 10f), 0f))
-                      drawText(measurer, "ENTRY: ${signal.entry}", Offset(10f, entryY - 24f), TextStyle(color = Color(0xFF2979FF), fontSize = 11.sp))
-
-                      drawLine(Color(0xFFFF1744), Offset(0f, slY), Offset(w, slY), 3f)
-                      drawText(measurer, "SL: ${signal.sl}", Offset(10f, slY - 24f), TextStyle(color = Color(0xFFFF1744), fontSize = 11.sp))
+                      drawLine(Color(0xFF00E676), Offset(0f, tpY), Offset(w, tpY), 4f)
+                      drawLine(Color(0xFF2979FF), Offset(0f, entryY), Offset(w, entryY), 4f, pathEffect = PathEffect.dashPathEffect(floatArrayOf(15f, 10f), 0f))
+                      drawLine(Color(0xFFFF1744), Offset(0f, slY), Offset(w, slY), 4f)
+                  }
+                  Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
+                      Text("SL: ${signal.sl}", color = Color(0xFFFF1744), fontSize = 11.sp)
+                      Text("Entry: ${signal.entry}", color = Color(0xFF2979FF), fontSize = 11.sp)
+                      Text("TP: ${signal.tp}", color = Color(0xFF00E676), fontSize = 11.sp)
                   }
               }
           }
@@ -365,7 +370,6 @@ jobs:
           import androidx.compose.foundation.layout.*
           import androidx.compose.foundation.lazy.LazyColumn
           import androidx.compose.foundation.lazy.items
-          import androidx.compose.foundation.shape.RoundedCornerShape
           import androidx.compose.material3.*
           import androidx.compose.runtime.*
           import androidx.compose.ui.Alignment
@@ -376,6 +380,7 @@ jobs:
           import androidx.compose.ui.unit.dp
           import androidx.compose.ui.unit.sp
           import androidx.core.content.ContextCompat
+          import com.tradesignal.bridge.data.TradeSignal
           import com.tradesignal.bridge.service.SignalListenerService
           import com.tradesignal.bridge.ui.SetupCanvas
 
@@ -390,7 +395,7 @@ jobs:
                   ContextCompat.startForegroundService(this, Intent(this, SignalListenerService::class.java))
                   setContent {
                       val context = LocalContext.current
-                      val signals by TradingApp.database.signalDao().getAllSignals().collectAsState(initial = emptyList())
+                      val signals by TradingApp.storage.signals.collectAsState()
                       Surface(color = Color(0xFF0D1117), modifier = Modifier.fillMaxSize()) {
                           Column(modifier = Modifier.padding(16.dp)) {
                               Text("SIGNAL BRIDGE [LIVE]", color = Color.White, fontWeight = FontWeight.Bold, fontSize = 18.sp)
