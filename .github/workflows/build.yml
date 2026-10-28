@@ -54,7 +54,6 @@ jobs:
           plugins {
               id("com.android.application") version "8.5.2" apply false
               id("org.jetbrains.kotlin.android") version "1.9.24" apply false
-              id("org.jetbrains.kotlin.plugin.serialization") version "1.9.24" apply false
           }
           EOF
 
@@ -63,7 +62,6 @@ jobs:
           plugins {
               id("com.android.application")
               id("org.jetbrains.kotlin.android")
-              id("org.jetbrains.kotlin.plugin.serialization")
           }
           android {
               namespace = "com.tradesignal.bridge"
@@ -88,13 +86,6 @@ jobs:
               composeOptions {
                   kotlinCompilerExtensionVersion = "1.5.14"
               }
-              packaging {
-                  resources {
-                      excludes += "/META-INF/{AL2.0,LGPL2.1}"
-                      excludes += "/META-INF/INDEX.LIST"
-                      excludes += "/META-INF/io.netty.versions.properties"
-                  }
-              }
           }
           dependencies {
               implementation("androidx.core:core-ktx:1.13.1")
@@ -104,14 +95,6 @@ jobs:
               implementation("androidx.compose.ui:ui")
               implementation("androidx.compose.ui:ui-graphics")
               implementation("androidx.compose.material3:material3")
-              
-              val ktor = "2.3.12"
-              implementation("io.ktor:ktor-server-core:$ktor")
-              implementation("io.ktor:ktor-server-cio:$ktor")
-              implementation("io.ktor:ktor-server-content-negotiation:$ktor")
-              implementation("io.ktor:ktor-serialization-kotlinx-json:$ktor")
-              
-              implementation("org.jetbrains.kotlinx:kotlinx-serialization-json:1.6.3")
               implementation("org.jetbrains.kotlinx:kotlinx-coroutines-android:1.8.1")
           }
           EOF
@@ -169,7 +152,6 @@ jobs:
               override fun onCreate() {
                   super.onCreate()
                   storage = SignalStorage(applicationContext)
-
                   val channel = NotificationChannel(
                       CHANNEL_ID,
                       "Trading Signals",
@@ -180,17 +162,15 @@ jobs:
           }
           EOF
 
-          # 6. SignalStorage.kt
+          # 6. SignalEntity.kt & Storage (Native Android JSON)
           cat << 'EOF' > app/src/main/java/com/tradesignal/bridge/data/SignalEntity.kt
           package com.tradesignal.bridge.data
           import android.content.Context
           import kotlinx.coroutines.flow.MutableStateFlow
           import kotlinx.coroutines.flow.StateFlow
-          import kotlinx.serialization.Serializable
-          import kotlinx.serialization.encodeToString
-          import kotlinx.serialization.json.Json
+          import org.json.JSONArray
+          import org.json.JSONObject
 
-          @Serializable
           data class TradeSignal(
               val id: Long = System.currentTimeMillis(),
               val symbol: String,
@@ -205,7 +185,6 @@ jobs:
 
           class SignalStorage(context: Context) {
               private val prefs = context.getSharedPreferences("trade_signals_prefs", Context.MODE_PRIVATE)
-              private val json = Json { ignoreUnknownKeys = true }
               private val _signals = MutableStateFlow<List<TradeSignal>>(loadSignals())
               val signals: StateFlow<List<TradeSignal>> = _signals
 
@@ -214,13 +193,45 @@ jobs:
                   val current = _signals.value.toMutableList()
                   current.add(0, signal)
                   _signals.value = current
-                  prefs.edit().putString("signals_json", json.encodeToString(current)).apply()
+                  save(current)
+              }
+
+              private fun save(list: List<TradeSignal>) {
+                  val arr = JSONArray()
+                  for (s in list) {
+                      val obj = JSONObject()
+                      obj.put("symbol", s.symbol)
+                      obj.put("action", s.action)
+                      obj.put("entry", s.entry)
+                      obj.put("sl", s.sl)
+                      obj.put("tp", s.tp)
+                      obj.put("timeframe", s.timeframe)
+                      obj.put("notes", s.notes)
+                      obj.put("timestamp", s.timestamp)
+                      arr.put(obj)
+                  }
+                  prefs.edit().putString("data", arr.toString()).apply()
               }
 
               private fun loadSignals(): List<TradeSignal> {
-                  val raw = prefs.getString("signals_json", null) ?: return emptyList()
+                  val raw = prefs.getString("data", null) ?: return emptyList()
+                  val list = mutableListOf<TradeSignal>()
                   return try {
-                      json.decodeFromString<List<TradeSignal>>(raw)
+                      val arr = JSONArray(raw)
+                      for (i in 0 until arr.length()) {
+                          val obj = arr.getJSONObject(i)
+                          list.add(TradeSignal(
+                              symbol = obj.optString("symbol", "XAUUSD"),
+                              action = obj.optString("action", "BUY"),
+                              entry = obj.optDouble("entry", 0.0),
+                              sl = obj.optDouble("sl", 0.0),
+                              tp = obj.optDouble("tp", 0.0),
+                              timeframe = obj.optString("timeframe", "15m"),
+                              notes = obj.optString("notes", ""),
+                              timestamp = obj.optLong("timestamp", System.currentTimeMillis())
+                          ))
+                      }
+                      list
                   } catch (e: Exception) {
                       emptyList()
                   }
@@ -228,7 +239,7 @@ jobs:
           }
           EOF
 
-          # 7. SignalListenerService.kt
+          # 7. SignalListenerService.kt (Native ServerSocket listener on port 8080)
           cat << 'EOF' > app/src/main/java/com/tradesignal/bridge/service/SignalListenerService.kt
           package com.tradesignal.bridge.service
           import android.app.*
@@ -239,20 +250,17 @@ jobs:
           import com.tradesignal.bridge.MainActivity
           import com.tradesignal.bridge.TradingApp
           import com.tradesignal.bridge.data.TradeSignal
-          import io.ktor.serialization.kotlinx.json.*
-          import io.ktor.server.application.*
-          import io.ktor.server.cio.*
-          import io.ktor.server.engine.*
-          import io.ktor.server.plugins.contentnegotiation.*
-          import io.ktor.server.request.*
-          import io.ktor.server.response.*
-          import io.ktor.server.routing.*
-          import kotlinx.coroutines.*
-          import kotlinx.serialization.json.Json
+          import org.json.JSONObject
+          import java.io.BufferedReader
+          import java.io.InputStreamReader
+          import java.io.OutputStreamWriter
+          import java.net.ServerSocket
+          import java.net.Socket
+          import kotlin.concurrent.thread
 
           class SignalListenerService : Service() {
-              private val serviceScope = CoroutineScope(Dispatchers.IO + SupervisorJob())
-              private var server: EmbeddedServer<*, *>? = null
+              private var serverSocket: ServerSocket? = null
+              private var isRunning = false
 
               override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
                   val notification = NotificationCompat.Builder(this, TradingApp.CHANNEL_ID)
@@ -262,22 +270,58 @@ jobs:
                       .build()
                   startForeground(1001, notification)
 
-                  if (server == null) {
-                      serviceScope.launch {
-                          server = embeddedServer(CIO, port = 8080, host = "0.0.0.0") {
-                              install(ContentNegotiation) { json(Json { ignoreUnknownKeys = true }) }
-                              routing {
-                                  post("/signal") {
-                                      val signal = call.receive<TradeSignal>()
-                                      TradingApp.storage.addSignal(signal)
-                                      notifyUser(signal)
-                                      call.respondText("Received")
-                                  }
+                  if (!isRunning) {
+                      isRunning = true
+                      thread {
+                          try {
+                              serverSocket = ServerSocket(8080)
+                              while (isRunning) {
+                                  val client = serverSocket?.accept() ?: break
+                                  thread { handleClient(client) }
                               }
-                          }.start(wait = false)
+                          } catch (e: Exception) {
+                              e.printStackTrace()
+                          }
                       }
                   }
                   return START_STICKY
+              }
+
+              private fun handleClient(socket: Socket) {
+                  try {
+                      val reader = BufferedReader(InputStreamReader(socket.getInputStream()))
+                      val writer = OutputStreamWriter(socket.getOutputStream())
+                      var line = reader.readLine()
+                      var length = 0
+                      while (!line.isNullOrEmpty()) {
+                          if (line.lowercase().startsWith("content-length:")) {
+                              length = line.substring(15).trim().toIntOrNull() ?: 0
+                          }
+                          line = reader.readLine()
+                      }
+                      if (length > 0) {
+                          val buffer = CharArray(length)
+                          reader.read(buffer, 0, length)
+                          val body = String(buffer)
+                          val obj = JSONObject(body)
+                          val signal = TradeSignal(
+                              symbol = obj.optString("symbol", "UNKNOWN"),
+                              action = obj.optString("action", "BUY"),
+                              entry = obj.optDouble("entry", 0.0),
+                              sl = obj.optDouble("sl", 0.0),
+                              tp = obj.optDouble("tp", 0.0),
+                              timeframe = obj.optString("timeframe", "15m"),
+                              notes = obj.optString("notes", "")
+                          )
+                          TradingApp.storage.addSignal(signal)
+                          notifyUser(signal)
+                      }
+                      writer.write("HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nConnection: close\r\n\r\nOK")
+                      writer.flush()
+                      socket.close()
+                  } catch (e: Exception) {
+                      e.printStackTrace()
+                  }
               }
 
               private fun notifyUser(signal: TradeSignal) {
@@ -296,9 +340,10 @@ jobs:
 
               override fun onDestroy() {
                   super.onDestroy()
-                  server?.stop(1000, 2000)
-                  serviceScope.cancel()
+                  isRunning = false
+                  try { serverSocket?.close() } catch (e: Exception) {}
               }
+
               override fun onBind(intent: Intent?): IBinder? = null
           }
           EOF
@@ -444,7 +489,7 @@ jobs:
           EOF
 
       - name: Build APK with Gradle
-        run: gradle assembleDebug --stacktrace
+        run: gradle assembleDebug
 
       - name: Upload APK File
         uses: actions/upload-artifact@v4
